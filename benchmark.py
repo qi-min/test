@@ -105,6 +105,8 @@ class ConfiguredRun:
     product_name: str
     rates: list[int]
     duration_seconds: float
+    rate_durations: list[float]      # per-rate duration; same length as rates
+    rate_interval_seconds: float     # pause (s) between each rate; applied uniformly
     storages: list[str]
     max_workers: int
     output: Path
@@ -233,6 +235,34 @@ def load_configured_run(path: Path) -> ConfiguredRun:
     if max_workers <= 0:
         raise RuntimeError("[run] max_workers 必须大于 0")
 
+    # Parse optional per-rate durations (rate_durations = 5,10,30)
+    raw_rate_durations = run_section.get("rate_durations", "").strip()
+    if raw_rate_durations:
+        try:
+            rate_durations = [
+                float(item.strip())
+                for item in raw_rate_durations.split(",")
+                if item.strip()
+            ]
+        except ValueError as exc:
+            raise RuntimeError(
+                "[run] rate_durations 必须是逗号分隔的正数"
+            ) from exc
+        if len(rate_durations) != len(rates):
+            raise RuntimeError(
+                f"[run] rate_durations 的数量 ({len(rate_durations)}) "
+                f"必须与 rates 的数量 ({len(rates)}) 相同"
+            )
+        if any(d <= 0 for d in rate_durations):
+            raise RuntimeError("[run] rate_durations 中每个值必须大于 0")
+    else:
+        rate_durations = [duration_seconds] * len(rates)
+
+    # Parse optional uniform interval between rates (rate_interval_seconds = 30)
+    rate_interval_seconds = run_section.getfloat("rate_interval_seconds", fallback=0.0)
+    if rate_interval_seconds < 0:
+        raise RuntimeError("[run] rate_interval_seconds 必须 >= 0")
+
     driver = product.get("driver", "e2b").strip().lower() or "e2b"
     if driver == "e2b":
         extra_metadata = config_json(product, "extra_metadata_json") or {}
@@ -292,6 +322,8 @@ def load_configured_run(path: Path) -> ConfiguredRun:
         product_name=product_name,
         rates=rates,
         duration_seconds=duration_seconds,
+        rate_durations=rate_durations,
+        rate_interval_seconds=rate_interval_seconds,
         storages=storages,
         max_workers=max_workers,
         output=Path(run_section.get("output", "results").strip() or "results"),
@@ -1395,18 +1427,39 @@ def print_plan(
     rates: list[int],
     duration: float,
     storages: list[str],
+    rate_durations: list[float] | None = None,
+    rate_interval_seconds: float = 0.0,
 ) -> None:
+    """Print the test plan.
+
+    rate_durations: per-rate durations overriding the global duration.
+    rate_interval_seconds: uniform pause between rates.
+    """
     print(f"产品: {product_name} ({provider})")
     print(f"存储场景: {', '.join(storages)}")
     print(f"并发档位: {', '.join(str(rate) + '/s' for rate in rates)}")
-    print(f"每档持续: {duration:g} 秒")
+    has_per_rate = rate_durations is not None and rate_durations != [duration] * len(rates)
+    if not has_per_rate:
+        print(f"每档持续: {duration:g} 秒")
+    if rate_interval_seconds > 0:
+        print(f"档位间隔: {rate_interval_seconds:g} 秒")
+    total_attempts = 0
     for storage in storages:
-        for rate in rates:
-            print(
-                f"  {storage:>4} @ {rate:>3}/s: "
-                f"{max(1, math.ceil(rate * duration))} 次创建"
-            )
-    print(f"预计 Sandbox.create 总次数: {attempts_for(rates, duration, storages)}")
+        for i, rate in enumerate(rates):
+            dur = rate_durations[i] if rate_durations else duration
+            n = max(1, math.ceil(rate * dur))
+            total_attempts += n
+            if has_per_rate:
+                print(
+                    f"  {storage:>4} @ {rate:>3}/s: "
+                    f"{n} 次创建  持续 {dur:g}s"
+                )
+            else:
+                print(
+                    f"  {storage:>4} @ {rate:>3}/s: "
+                    f"{n} 次创建"
+                )
+    print(f"预计 Sandbox.create 总次数: {total_attempts}")
 
 
 def execute_run(
@@ -1421,14 +1474,35 @@ def execute_run(
     output: Path,
     confirm: bool,
     exclude_first_from_mean: bool,
+    rate_durations: list[float] | None = None,
+    rate_interval_seconds: float = 0.0,
 ) -> int:
+    """Execute the benchmark run.
+
+    rate_durations: per-rate durations (same length as rates). Falls back to
+                    duration_seconds for each rate when not provided.
+    rate_interval_seconds: seconds to sleep after each rate completes before
+                    starting the next one. Applied uniformly across all rates.
+    """
     if duration_seconds <= 0:
         raise RuntimeError("duration_seconds 必须大于 0")
     if max_workers <= 0:
         raise RuntimeError("max_workers 必须大于 0")
+
+    # Build effective per-rate durations.
+    effective_durations = rate_durations if rate_durations else [duration_seconds] * len(rates)
+
     for storage in storages:
         metadata_for(storage, settings)
-    print_plan(provider, product_name, rates, duration_seconds, storages)
+    print_plan(
+        provider,
+        product_name,
+        rates,
+        duration_seconds,
+        storages,
+        rate_durations=rate_durations,
+        rate_interval_seconds=rate_interval_seconds,
+    )
     print(f"SDK 驱动: {settings.driver}")
     if isinstance(settings, VolcengineNativeSettings):
         print(
@@ -1455,9 +1529,11 @@ def execute_run(
     all_results: list[TrialResult] = []
     try:
         for storage in storages:
-            for rate in rates:
+            for i, rate in enumerate(rates):
+                rate_dur = effective_durations[i]
                 print(
-                    f"\n开始: product={product_name}, storage={storage}, rate={rate}/s"
+                    f"\n开始: product={product_name}, storage={storage}, "
+                    f"rate={rate}/s, duration={rate_dur:g}s"
                 )
                 all_results.extend(
                     run_rate(
@@ -1466,11 +1542,18 @@ def execute_run(
                         product_name=product_name,
                         storage=storage,
                         rate=rate,
-                        duration_seconds=duration_seconds,
+                        duration_seconds=rate_dur,
                         max_workers=max_workers,
                         native_runtime=native_runtime,
                     )
                 )
+                is_last = (i == len(rates) - 1)
+                if rate_interval_seconds > 0 and not is_last:
+                    print(
+                        f"  档位 {rate}/s 完成，等待 {rate_interval_seconds:g}s 后进入下一档...",
+                        flush=True,
+                    )
+                    time.sleep(rate_interval_seconds)
     finally:
         if native_runtime is not None:
             native_runtime.close()
@@ -1522,6 +1605,8 @@ def main() -> int:
             output=configured.output,
             confirm=args.confirm,
             exclude_first_from_mean=configured.exclude_first_from_mean,
+            rate_durations=configured.rate_durations,
+            rate_interval_seconds=configured.rate_interval_seconds,
         )
 
     settings = load_settings(require_credentials=True)
