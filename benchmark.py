@@ -18,6 +18,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
 
+import requests
 from dotenv import load_dotenv
 from e2b_code_interpreter import Sandbox
 
@@ -34,6 +35,13 @@ DEFAULT_PRODUCT_NAMES = {
 PRINT_LOCK = threading.Lock()
 
 
+# Check type constants
+CHECK_TYPE_COMMAND = "command"
+CHECK_TYPE_REST = "rest"
+REST_CHECK_TIMEOUT_S = 60.0       # 1 min overall timeout for REST check
+REST_CHECK_POLL_INTERVAL_S = 0.01  # 10ms poll interval
+
+
 @dataclass(frozen=True)
 class E2BSettings:
     driver: str
@@ -48,6 +56,9 @@ class E2BSettings:
     file_metadata_key: str
     file_config: dict | None
     extra_metadata: dict[str, str]
+    check_type: str = CHECK_TYPE_COMMAND  # "command" or "rest"
+    rest_port: int = 0
+    rest_path: str = "/healthz"
 
 
 @dataclass(frozen=True)
@@ -273,6 +284,24 @@ def load_configured_run(path: Path) -> ConfiguredRun:
             raise RuntimeError(
                 f"[{profile_name}] extra_metadata_json 的键和值必须是字符串"
             )
+        raw_check_type = product.get("check_type", CHECK_TYPE_COMMAND).strip().lower()
+        if raw_check_type not in (CHECK_TYPE_COMMAND, CHECK_TYPE_REST):
+            raise RuntimeError(
+                f"[{profile_name}] check_type 只支持 '{CHECK_TYPE_COMMAND}' 或 '{CHECK_TYPE_REST}'"
+            )
+        raw_rest_port = product.get("rest_port", "0").strip()
+        try:
+            rest_port = int(raw_rest_port) if raw_rest_port else 0
+        except ValueError as exc:
+            raise RuntimeError(
+                f"[{profile_name}] rest_port 必须是整数"
+            ) from exc
+        if raw_check_type == CHECK_TYPE_REST and rest_port <= 0:
+            raise RuntimeError(
+                f"[{profile_name}] check_type=rest 时必须配置有效的 rest_port（正整数）"
+            )
+        rest_path = product.get("rest_path", "/healthz").strip() or "/healthz"
+
         settings: Settings = E2BSettings(
             driver=driver,
             api_key=config_secret(product, "api_key", "api_key_env"),
@@ -286,6 +315,9 @@ def load_configured_run(path: Path) -> ConfiguredRun:
             file_metadata_key=product.get("file_metadata_key", "").strip(),
             file_config=config_json(product, "file_config_json"),
             extra_metadata=extra_metadata,
+            check_type=raw_check_type,
+            rest_port=rest_port,
+            rest_path=rest_path,
         )
     elif driver == "volcengine_native":
         settings = VolcengineNativeSettings(
@@ -683,33 +715,113 @@ def one_trial(
             getattr(sandbox, "sandbox_id", getattr(sandbox, "id", ""))
         )
 
-        current_phase = "first_command"
-        first_result = sandbox.commands.run(
-            "python3 -c \"print('SANDBOX_FIRST_COMMAND')\"",
-            timeout=30,
-        )
-        first_command_ready = time.perf_counter()
-        first_command_latency_ms = (first_command_ready - create_start) * 1000
-        first_stdout = getattr(first_result, "stdout", "") or ""
-        first_command_success = "SANDBOX_FIRST_COMMAND" in first_stdout
-        if not first_command_success:
-            failure_phase = "first_command"
-            error_type = "FirstCommandCheckFailed"
-            error_message = "首条命令未返回预期标记"
+        if settings.check_type == CHECK_TYPE_REST:
+            # --- REST check mode ---
+            # Poll the REST endpoint until it returns HTTP 200, with 10ms interval
+            # and 1-minute overall timeout.
+            current_phase = "first_command"
+            host = sandbox.get_host(settings.rest_port)
+            rest_path = settings.rest_path
+            if not rest_path.startswith("/"):
+                rest_path = "/" + rest_path
+            url = f"https://{host}{rest_path}"
+            access_token = getattr(sandbox, "traffic_access_token", None) or ""
+            headers = {}
+            if access_token:
+                headers["e2b-traffic-access-token"] = access_token
+
+            rest_deadline = create_start + REST_CHECK_TIMEOUT_S
+            rest_poll_count = 0
+            first_rest_ok = False
+            last_status_code: int | None = None
+            while True:
+                try:
+                    response = requests.get(url, headers=headers, timeout=10)
+                    last_status_code = response.status_code
+                    rest_poll_count += 1
+                    if response.status_code == 200:
+                        first_rest_ok = True
+                        break
+                except Exception:
+                    rest_poll_count += 1
+
+                remaining = rest_deadline - time.perf_counter()
+                if remaining <= 0:
+                    break
+                time.sleep(min(REST_CHECK_POLL_INTERVAL_S, remaining))
+
+            first_command_ready = time.perf_counter()
+            first_command_latency_ms = (first_command_ready - create_start) * 1000
+
+            if not first_rest_ok:
+                failure_phase = "first_command"
+                error_type = "RestCheckTimeout"
+                error_message = (
+                    f"REST 检查超过 {REST_CHECK_TIMEOUT_S:g} 秒仍未返回 200；"
+                    f"最后状态码={last_status_code or '(无响应)'}；"
+                    f"url={url}"
+                )[:1000]
+            else:
+                # Second REST check (confirm)
+                current_phase = "second_command"
+                second_rest_ok = False
+                last_status_code2: int | None = None
+                rest_deadline2 = time.perf_counter() + REST_CHECK_TIMEOUT_S
+                while True:
+                    try:
+                        response2 = requests.get(url, headers=headers, timeout=10)
+                        last_status_code2 = response2.status_code
+                        if response2.status_code == 200:
+                            second_rest_ok = True
+                            break
+                    except Exception:
+                        pass
+
+                    remaining2 = rest_deadline2 - time.perf_counter()
+                    if remaining2 <= 0:
+                        break
+                    time.sleep(min(REST_CHECK_POLL_INTERVAL_S, remaining2))
+
+                second_command_ready = time.perf_counter()
+                second_command_latency_ms = (second_command_ready - create_start) * 1000
+                ready_success = second_rest_ok
+                if not ready_success:
+                    failure_phase = "second_command"
+                    error_type = "RestCheckSecondTimeout"
+                    error_message = (
+                        f"第二次 REST 检查超过 {REST_CHECK_TIMEOUT_S:g} 秒仍未返回 200；"
+                        f"最后状态码={last_status_code2 or '(无响应)'}；"
+                        f"url={url}"
+                    )[:1000]
         else:
-            current_phase = "second_command"
-            second_result = sandbox.commands.run(
-                "python3 -c \"print('SANDBOX_SECOND_COMMAND')\"",
+            # --- command check mode (default) ---
+            current_phase = "first_command"
+            first_result = sandbox.commands.run(
+                "python3 -c \"print('SANDBOX_FIRST_COMMAND')\"",
                 timeout=30,
             )
-            second_command_ready = time.perf_counter()
-            second_command_latency_ms = (second_command_ready - create_start) * 1000
-            second_stdout = getattr(second_result, "stdout", "") or ""
-            ready_success = "SANDBOX_SECOND_COMMAND" in second_stdout
-            if not ready_success:
-                failure_phase = "second_command"
-                error_type = "SecondCommandCheckFailed"
-                error_message = "第二条命令未返回预期标记"
+            first_command_ready = time.perf_counter()
+            first_command_latency_ms = (first_command_ready - create_start) * 1000
+            first_stdout = getattr(first_result, "stdout", "") or ""
+            first_command_success = "SANDBOX_FIRST_COMMAND" in first_stdout
+            if not first_command_success:
+                failure_phase = "first_command"
+                error_type = "FirstCommandCheckFailed"
+                error_message = "首条命令未返回预期标记"
+            else:
+                current_phase = "second_command"
+                second_result = sandbox.commands.run(
+                    "python3 -c \"print('SANDBOX_SECOND_COMMAND')\"",
+                    timeout=30,
+                )
+                second_command_ready = time.perf_counter()
+                second_command_latency_ms = (second_command_ready - create_start) * 1000
+                second_stdout = getattr(second_result, "stdout", "") or ""
+                ready_success = "SANDBOX_SECOND_COMMAND" in second_stdout
+                if not ready_success:
+                    failure_phase = "second_command"
+                    error_type = "SecondCommandCheckFailed"
+                    error_message = "第二条命令未返回预期标记"
     except Exception as exc:  # 保留单次失败，不中断整轮测试。
         failure_phase = current_phase
         error_type = type(exc).__name__
