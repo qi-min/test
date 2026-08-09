@@ -590,17 +590,6 @@ def one_trial_volcengine_native(
         error_type = type(exc).__name__
         error_message = str(exc).replace("\r", " ").replace("\n", " ")[:1000]
         error_traceback = traceback.format_exc()
-    finally:
-        if sandbox_id:
-            try:
-                runtime.kill(settings, sandbox_id)
-            except Exception as exc:
-                cleanup_success = False
-                cleanup_error_type = type(exc).__name__
-                cleanup_error_message = (
-                    str(exc).replace("\r", " ").replace("\n", " ")[:1000]
-                )
-                cleanup_error_traceback = traceback.format_exc()
 
     return TrialResult(
         provider=provider,
@@ -659,7 +648,7 @@ def one_trial(
     scheduled_monotonic: float,
     scheduled_at_utc: str,
     native_runtime: VolcengineNativeRuntime | None = None,
-) -> TrialResult:
+) -> tuple[TrialResult, Sandbox | None]:
     if isinstance(settings, VolcengineNativeSettings):
         if native_runtime is None:
             raise RuntimeError("火山原生模式缺少已初始化的 SDK 客户端")
@@ -676,7 +665,7 @@ def one_trial(
             trial_index=trial_index,
             scheduled_monotonic=scheduled_monotonic,
             scheduled_at_utc=scheduled_at_utc,
-        )
+        ), None
 
     sandbox = None
     cleanup_success = True
@@ -827,20 +816,6 @@ def one_trial(
         error_type = type(exc).__name__
         error_message = str(exc).replace("\r", " ").replace("\n", " ")[:1000]
         error_traceback = traceback.format_exc()
-    finally:
-        if sandbox is not None:
-            try:
-                cleanup_success = bool(sandbox.kill())
-                if not cleanup_success:
-                    cleanup_error_type = "CleanupReturnedFalse"
-                    cleanup_error_message = "sandbox.kill() 返回 False"
-            except Exception as exc:
-                cleanup_success = False
-                cleanup_error_type = type(exc).__name__
-                cleanup_error_message = (
-                    str(exc).replace("\r", " ").replace("\n", " ")[:1000]
-                )
-                cleanup_error_traceback = traceback.format_exc()
 
     return TrialResult(
         provider=provider,
@@ -882,7 +857,7 @@ def one_trial(
         cleanup_error_traceback=cleanup_error_traceback,
         ready_poll_count=0,
         last_observed_status="commands_ready" if ready_success else "",
-    )
+    ), sandbox
 
 
 def run_rate(
@@ -897,7 +872,7 @@ def run_rate(
 ) -> list[TrialResult]:
     attempts = max(1, math.ceil(rate * duration_seconds))
     effective_max_workers = min(max_workers, attempts)
-    futures: list[Future[TrialResult]] = []
+    futures: list[Future[tuple[TrialResult, Sandbox | None]]] = []
     run_start = time.perf_counter() + 0.25
     utc_start = datetime.now(timezone.utc).timestamp() + 0.25
 
@@ -931,10 +906,13 @@ def run_rate(
                 )
             )
 
-        results = []
+        results: list[TrialResult] = []
+        sandboxes: list[Sandbox | None] = []
         completed = 0
         for future in as_completed(futures):
-            results.append(future.result())
+            result, sandbox = future.result()
+            results.append(result)
+            sandboxes.append(sandbox)
             completed += 1
             if completed == attempts or completed % max(1, attempts // 10) == 0:
                 with PRINT_LOCK:
@@ -942,6 +920,40 @@ def run_rate(
                         f"  进度 {completed}/{attempts}",
                         flush=True,
                     )
+
+    # 批量清理：每轮 rate 结束后统一删除所有沙箱
+    print(f"  清理 {len(results)} 个沙箱...", flush=True)
+    for result, sandbox in zip(results, sandboxes):
+        if isinstance(settings, VolcengineNativeSettings):
+            if not result.sandbox_id:
+                continue
+            try:
+                if native_runtime is not None:
+                    native_runtime.kill(settings, result.sandbox_id)
+            except Exception as exc:
+                result.cleanup_success = False
+                result.cleanup_error_type = type(exc).__name__
+                result.cleanup_error_message = (
+                    str(exc).replace("\r", " ").replace("\n", " ")[:1000]
+                )
+                result.cleanup_error_traceback = traceback.format_exc()
+        else:
+            if sandbox is None:
+                continue
+            try:
+                ok = bool(sandbox.kill())
+                if not ok:
+                    result.cleanup_success = False
+                    result.cleanup_error_type = "CleanupReturnedFalse"
+                    result.cleanup_error_message = "sandbox.kill() 返回 False"
+            except Exception as exc:
+                result.cleanup_success = False
+                result.cleanup_error_type = type(exc).__name__
+                result.cleanup_error_message = (
+                    str(exc).replace("\r", " ").replace("\n", " ")[:1000]
+                )
+                result.cleanup_error_traceback = traceback.format_exc()
+
     return sorted(results, key=lambda row: row.trial_index)
 
 
@@ -1725,7 +1737,7 @@ def main() -> int:
     if args.command == "smoke":
         metadata_for(args.storage, settings)
         print(f"开始 smoke 测试，存储场景={args.storage}")
-        result = one_trial(
+        result, sandbox = one_trial(
             settings=settings,
             provider=args.provider,
             product_name=DEFAULT_PRODUCT_NAMES.get(args.provider, args.provider),
@@ -1738,6 +1750,21 @@ def main() -> int:
             scheduled_monotonic=time.perf_counter(),
             scheduled_at_utc=datetime.now(timezone.utc).isoformat(),
         )
+        # smoke 测试为单次创建，结束后立即清理
+        if sandbox is not None:
+            try:
+                ok = bool(sandbox.kill())
+                if not ok:
+                    result.cleanup_success = False
+                    result.cleanup_error_type = "CleanupReturnedFalse"
+                    result.cleanup_error_message = "sandbox.kill() 返回 False"
+            except Exception as exc:
+                result.cleanup_success = False
+                result.cleanup_error_type = type(exc).__name__
+                result.cleanup_error_message = (
+                    str(exc).replace("\r", " ").replace("\n", " ")[:1000]
+                )
+                result.cleanup_error_traceback = traceback.format_exc()
         output_dir = save_results([result], args.output, "连通性测试")
         print(json.dumps(asdict(result), ensure_ascii=False, indent=2))
         print(f"结果目录: {output_dir.resolve()}")
