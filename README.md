@@ -15,7 +15,7 @@
 1 次/秒、10 次/秒、50 次/秒、100 次/秒、200 次/秒
 ```
 
-无挂载测试按本文要求每档持续发压60秒；OSS/NAS 示例命令每档持续发压1秒。
+每个档位按配置的沙箱数量执行；调度频率由 TPS 档位决定。
 每次运行都会生成独立的 CSV、JSON 和失败日志。
 
 程序执行过程如下：
@@ -23,7 +23,7 @@
 ```text
 读取 benchmark.ini
 → 根据 [run].product 选择阿里云或字节/火山
-→ 按 rates 和 duration_seconds 生成定时启动任务
+→ 按 rates 和 sandbox_counts 生成定量定时启动任务
 → 并发创建 Sandbox 并等待功能就绪
 → 清理本轮创建的 Sandbox
 → 写入本次原始明细、汇总、失败日志
@@ -86,7 +86,7 @@ notepad benchmark.ini
 python benchmark.py run-config --config benchmark.ini
 ```
 
-这条命令只显示产品、档位、持续时间和预计创建数量，不会创建沙箱，也不会
+这条命令只显示产品、档位和各档位预计创建数量，不会创建沙箱，也不会
 产生云资源费用。
 
 ### 5. 正式运行
@@ -101,7 +101,7 @@ python benchmark.py run-config --config benchmark.ini --confirm
 产品名的新目录，例如：
 
 ```text
-results/20260804_120000_123_阿里云_启动并发速度_无挂载_1-10-50tps_持续60s/
+results/20260804_120000_123_阿里云_启动并发速度_无挂载_1-10-50tps_各10-100-500个/
 ```
 
 重复执行正式运行命令不会覆盖之前的测试目录：
@@ -128,11 +128,19 @@ Copy-Item benchmark.template.ini benchmark.ini
 [run]
 product = aliyun
 rates = 1,10,50
-duration_seconds = 60
+sandbox_counts = 10,100,500
 storages = none
 max_workers = 1000
 output = results
 exclude_first_from_mean = true
+```
+
+`sandbox_counts` 可选；填写时必须与 `rates` 的数量完全一致。若未填写，则每个
+档位均使用 `default_sandbox_count`，例如：
+
+```ini
+default_sandbox_count = 100
+# sandbox_counts =
 ```
 
 产品选择：
@@ -183,7 +191,7 @@ python benchmark.py run-config --config benchmark.ini --confirm
 ```ini
 [run]
 rates = 1,10,50,100,200
-duration_seconds = 60
+sandbox_counts = 10,100,500,1000,2000
 storages = none
 max_workers = 1000
 exclude_first_from_mean = true
@@ -213,7 +221,7 @@ python benchmark.py run-config --config benchmark.ini
 python benchmark.py run-config --config benchmark.ini --confirm
 ```
 
-两次运行使用完全相同的 TPS、持续时间、线程上限和均值口径。阿里云通过 E2B
+两次运行使用完全相同的 TPS、沙箱数量、线程上限和均值口径。阿里云通过 E2B
 创建并执行两条命令，字节通过原生 `CreateSandbox` 创建并轮询
 `DescribeSandbox` 到 Ready。两者的发压方式和统计方法相同，但“功能就绪”的
 判定接口不同，报告中应同时保留 `driver` 字段和第11节的里程碑定义。
@@ -222,7 +230,7 @@ python benchmark.py run-config --config benchmark.ini --confirm
 当前档位计算：
 
 ```text
-effective_max_workers = min(max_workers, rates × duration_seconds)
+effective_max_workers = min(max_workers, sandbox_count)
 ```
 
 例如 `max_workers = 1000`、持续60秒时，1/10/50/100/200 TPS 的实际线程上限
@@ -305,7 +313,7 @@ trial 对应一次 CreateSandbox 调用，避免 SDK 隐式重试改变请求数
 [run]
 product = vol
 rates = 1
-duration_seconds = 2
+sandbox_counts = 2
 storages = none
 max_workers = 1000
 output = results
@@ -354,7 +362,7 @@ AK/SK。
 [run]
 product = vol
 rates = 1,10,50,100,200
-duration_seconds = 60
+sandbox_counts = 60,600,3000,6000,12000
 storages = none
 max_workers = 1000
 output = results
@@ -556,8 +564,8 @@ E2B_SANDBOX_TIMEOUT=300
 
 `E2B_API_KEY`、`E2B_API_URL` 和 `E2B_DOMAIN` 必须属于同一地域。
 
-`E2B_SANDBOX_TIMEOUT` 与测试命令中的 `--duration-seconds` 不是一回事：
-前者是单个 Sandbox 的最长存活时间，后者是本地客户端持续发请求的时间。
+`E2B_SANDBOX_TIMEOUT` 是单个 Sandbox 的最长存活时间，与
+`--sandbox-counts`（本地客户端每个档位创建的数量）不是一回事。
 
 如果不是北京地域，需要把 `cn-beijing` 换成实际地域。使用自定义域名时，
 以阿里云项目提供的 API URL 和 Domain 为准。
@@ -615,7 +623,7 @@ python benchmark.py smoke --storage none
 正式命令格式：
 
 ```powershell
-python benchmark.py run --rates <每秒启动数> --duration-seconds <持续秒数> --storages none --confirm
+python benchmark.py run --rates <每秒启动数> --sandbox-counts <各档位沙箱数量> --storages none --confirm
 ```
 
 ### 6.1 `--rates`
@@ -630,22 +638,21 @@ python benchmark.py run --rates <每秒启动数> --duration-seconds <持续秒�
 
 表示每秒计划创建 50 个 Sandbox。
 
-### 6.2 `--duration-seconds`
+### 6.2 `--sandbox-counts`
 
-表示按照目标速率持续发请求多少秒，不是单个 Sandbox 运行多少秒。
+表示每个 TPS 档位要创建多少个 Sandbox；数量必须与 `--rates` 中档位一一对应。
 
 例如：
 
 ```text
---rates 50 --duration-seconds 60
+--rates 50 --sandbox-counts 3000
 ```
 
 表示：
 
 ```text
 每秒发起 50 次创建
-持续发起 60 秒
-计划创建 50 × 60 = 3000 个 Sandbox
+创建满 3000 个 Sandbox 后结束该档位
 ```
 
 每个 Sandbox 的实际流程为：
@@ -668,7 +675,7 @@ python benchmark.py run --rates <每秒启动数> --duration-seconds <持续秒�
 不加 `--confirm` 时，程序只显示计划，不调用阿里云：
 
 ```powershell
-python benchmark.py run --rates 50 --duration-seconds 60 --storages none
+python benchmark.py run --rates 50 --sandbox-counts 3000 --storages none
 ```
 
 ---
@@ -678,11 +685,11 @@ python benchmark.py run --rates 50 --duration-seconds 60 --storages none
 可以先使用 `plan` 查看调用量，它不会创建云资源：
 
 ```powershell
-python benchmark.py plan --rates 1 --duration-seconds 60 --storages none
-python benchmark.py plan --rates 10 --duration-seconds 60 --storages none
-python benchmark.py plan --rates 50 --duration-seconds 60 --storages none
-python benchmark.py plan --rates 100 --duration-seconds 60 --storages none
-python benchmark.py plan --rates 200 --duration-seconds 60 --storages none
+python benchmark.py plan --rates 1 --sandbox-counts 60 --storages none
+python benchmark.py plan --rates 10 --sandbox-counts 600 --storages none
+python benchmark.py plan --rates 50 --sandbox-counts 3000 --storages none
+python benchmark.py plan --rates 100 --sandbox-counts 6000 --storages none
+python benchmark.py plan --rates 200 --sandbox-counts 12000 --storages none
 ```
 
 各档计划创建数量：
@@ -709,7 +716,7 @@ python benchmark.py plan --rates 200 --duration-seconds 60 --storages none
 ### 8.1 1次/秒，持续60秒
 
 ```powershell
-python benchmark.py run --rates 1 --duration-seconds 60 --storages none --confirm
+python benchmark.py run --rates 1 --sandbox-counts 60 --storages none --confirm
 ```
 
 计划创建60个 Sandbox。
@@ -717,7 +724,7 @@ python benchmark.py run --rates 1 --duration-seconds 60 --storages none --confir
 ### 8.2 10次/秒，持续60秒
 
 ```powershell
-python benchmark.py run --rates 10 --duration-seconds 60 --storages none --confirm
+python benchmark.py run --rates 10 --sandbox-counts 600 --storages none --confirm
 ```
 
 计划创建600个 Sandbox。
@@ -725,7 +732,7 @@ python benchmark.py run --rates 10 --duration-seconds 60 --storages none --confi
 ### 8.3 50次/秒，持续60秒
 
 ```powershell
-python benchmark.py run --rates 50 --duration-seconds 60 --storages none --confirm
+python benchmark.py run --rates 50 --sandbox-counts 3000 --storages none --confirm
 ```
 
 计划创建3000个 Sandbox。
@@ -733,7 +740,7 @@ python benchmark.py run --rates 50 --duration-seconds 60 --storages none --confi
 ### 8.4 100次/秒，持续60秒
 
 ```powershell
-python benchmark.py run --rates 100 --duration-seconds 60 --storages none --confirm
+python benchmark.py run --rates 100 --sandbox-counts 6000 --storages none --confirm
 ```
 
 计划创建6000个 Sandbox。
@@ -741,7 +748,7 @@ python benchmark.py run --rates 100 --duration-seconds 60 --storages none --conf
 ### 8.5 200次/秒，持续60秒
 
 ```powershell
-python benchmark.py run --rates 200 --duration-seconds 60 --storages none --confirm
+python benchmark.py run --rates 200 --sandbox-counts 12000 --storages none --confirm
 ```
 
 计划创建12000个 Sandbox。
@@ -820,13 +827,13 @@ results/
 `result_directory` 可以定位到原始测试目录，同一厂商重复测试同一档位不会覆盖。
 
 随后脚本会根据历史表重建 `results/全局测试结果.csv`。矩阵每行由
-`test_name + provider + product_name + driver + storage + duration_seconds + metric`
+`test_name + provider + product_name + driver + storage + sandbox_count + metric`
 唯一确定，各档位分别
 放在 `1tps`、`10tps`、`50tps`、`100tps`、`200tps` 等列中。例如：
 
 ```text
-test_name,provider,product_name,driver,storage,duration_seconds,metric,unit,1tps,10tps,50tps
-启动并发速度,aliyun,阿里云,e2b,none,60,api_latency_p50_ms,ms,420.1,510.2,890.4
+test_name,provider,product_name,driver,storage,sandbox_count,metric,unit,1tps,10tps,50tps
+启动并发速度,aliyun,阿里云,e2b,none,3000,api_latency_p50_ms,ms,420.1,510.2,890.4
 启动并发速度,vol,字节,volcengine_native,none,60,api_latency_p50_ms,ms,380.3,470.5,760.8
 ```
 
@@ -865,7 +872,7 @@ product = vol
 | `storage` | 存储场景，`none` 表示无挂载 |
 | `target_rate_per_s` | 目标启动速率，单位为次/秒 |
 | `rate_label` | 便于制作对比矩阵的档位标签，例如 `1tps`、`10tps`、`50tps` |
-| `duration_seconds` | 持续发压时间，单位为秒 |
+| `sandbox_count` | 当前 TPS 档位计划创建的沙箱数量 |
 | `configured_max_workers` | 命令配置的线程上限，默认1000 |
 | `effective_max_workers` | 当前档位实际建立的最大线程数，不超过请求总数 |
 | `attempts` | 计划并实际安排的请求数量 |
@@ -946,7 +953,7 @@ min、max、mean、P50、P90、P95、P99
 | `P99` | 99%的有效样本不超过该值 |
 
 所有延迟单位均为毫秒（ms）。这些统计值已经按有效样本计算，不能再除以
-`attempts` 或 `duration_seconds`。
+`attempts` 或 `sandbox_count`。
 
 完整可复制说明：
 
@@ -1018,14 +1025,14 @@ notepad benchmark.ini
 [run]
 product = aliyun
 rates = 1,10,50,100,200
-duration_seconds = 60
+sandbox_counts = 10,100,500,1000,2000
 storages = none
 max_workers = 1000
 output = results
 exclude_first_from_mean = true
 ```
 
-建议先把 `rates = 1`、`duration_seconds = 2` 做小规模连通性验证。先预览，确认
+建议先把 `rates = 1`、`sandbox_counts = 2` 做小规模连通性验证。先预览，确认
 产品、档位和预计请求数无误后再正式执行：
 
 ```powershell
@@ -1035,7 +1042,7 @@ python benchmark.py run-config --config benchmark.ini --confirm
 
 小规模测试成功后，再改回正式档位并重复上述两条命令。测试阿里云时设置
 `product = aliyun`，测试字节/火山时只改为 `product = vol`；公平对比时不要改变
-`rates`、`duration_seconds`、`max_workers` 和 `exclude_first_from_mean`。
+`rates`、`sandbox_counts`、`max_workers` 和 `exclude_first_from_mean`。
 
 如果选择了 Conda，应在上述命令前先执行：
 
@@ -1185,31 +1192,31 @@ python benchmark.py smoke --storage oss
 #### OSS 1次/秒
 
 ```powershell
-python benchmark.py run --rates 1 --duration-seconds 1 --storages oss --confirm
+python benchmark.py run --rates 1 --sandbox-counts 1 --storages oss --confirm
 ```
 
 #### OSS 10次/秒
 
 ```powershell
-python benchmark.py run --rates 10 --duration-seconds 1 --storages oss --confirm
+python benchmark.py run --rates 10 --sandbox-counts 10 --storages oss --confirm
 ```
 
 #### OSS 50次/秒
 
 ```powershell
-python benchmark.py run --rates 50 --duration-seconds 1 --storages oss --confirm
+python benchmark.py run --rates 50 --sandbox-counts 50 --storages oss --confirm
 ```
 
 #### OSS 100次/秒
 
 ```powershell
-python benchmark.py run --rates 100 --duration-seconds 1 --storages oss --confirm
+python benchmark.py run --rates 100 --sandbox-counts 100 --storages oss --confirm
 ```
 
 #### OSS 200次/秒
 
 ```powershell
-python benchmark.py run --rates 200 --duration-seconds 1 --storages oss --confirm
+python benchmark.py run --rates 200 --sandbox-counts 200 --storages oss --confirm
 ```
 
 OSS 五档合计计划创建：
@@ -1351,31 +1358,31 @@ python benchmark.py smoke --storage file
 #### NAS 1次/秒
 
 ```powershell
-python benchmark.py run --rates 1 --duration-seconds 1 --storages file --confirm
+python benchmark.py run --rates 1 --sandbox-counts 1 --storages file --confirm
 ```
 
 #### NAS 10次/秒
 
 ```powershell
-python benchmark.py run --rates 10 --duration-seconds 1 --storages file --confirm
+python benchmark.py run --rates 10 --sandbox-counts 10 --storages file --confirm
 ```
 
 #### NAS 50次/秒
 
 ```powershell
-python benchmark.py run --rates 50 --duration-seconds 1 --storages file --confirm
+python benchmark.py run --rates 50 --sandbox-counts 50 --storages file --confirm
 ```
 
 #### NAS 100次/秒
 
 ```powershell
-python benchmark.py run --rates 100 --duration-seconds 1 --storages file --confirm
+python benchmark.py run --rates 100 --sandbox-counts 100 --storages file --confirm
 ```
 
 #### NAS 200次/秒
 
 ```powershell
-python benchmark.py run --rates 200 --duration-seconds 1 --storages file --confirm
+python benchmark.py run --rates 200 --sandbox-counts 200 --storages file --confirm
 ```
 
 NAS 五档合计计划创建：

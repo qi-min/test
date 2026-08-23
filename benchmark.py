@@ -86,7 +86,7 @@ class TrialResult:
     driver: str
     storage: str
     target_rate_per_s: int
-    duration_seconds: float
+    sandbox_count: int
     configured_max_workers: int
     effective_max_workers: int
     trial_index: int
@@ -115,8 +115,7 @@ class ConfiguredRun:
     provider: str
     product_name: str
     rates: list[int]
-    duration_seconds: float
-    rate_durations: list[float]      # per-rate duration; same length as rates
+    sandbox_counts: list[int]        # per-rate sandbox count; same length as rates
     rate_interval_seconds: float     # pause (s) between each rate; applied uniformly
     storages: list[str]
     max_workers: int
@@ -235,39 +234,43 @@ def load_configured_run(path: Path) -> ConfiguredRun:
     product = parser[profile_name]
     product_name = product.get("name", provider).strip() or provider
 
-    duration_seconds = run_section.getfloat("duration_seconds", fallback=60.0)
     max_workers = run_section.getint("max_workers", fallback=DEFAULT_MAX_WORKERS)
     exclude_first = run_section.getboolean(
         "exclude_first_from_mean",
         fallback=True,
     )
-    if duration_seconds <= 0:
-        raise RuntimeError("[run] duration_seconds 必须大于 0")
     if max_workers <= 0:
         raise RuntimeError("[run] max_workers 必须大于 0")
 
-    # Parse optional per-rate durations (rate_durations = 5,10,30)
-    raw_rate_durations = run_section.get("rate_durations", "").strip()
-    if raw_rate_durations:
+    # A per-rate list overrides the shared default count.
+    try:
+        default_sandbox_count = run_section.getint(
+            "default_sandbox_count", fallback=1
+        )
+    except ValueError as exc:
+        raise RuntimeError("[run] default_sandbox_count 必须是正整数") from exc
+    if default_sandbox_count <= 0:
+        raise RuntimeError("[run] default_sandbox_count 必须大于 0")
+
+    raw_sandbox_counts = run_section.get("sandbox_counts", "").strip()
+    if not raw_sandbox_counts:
+        sandbox_counts = [default_sandbox_count] * len(rates)
+    else:
         try:
-            rate_durations = [
-                float(item.strip())
-                for item in raw_rate_durations.split(",")
+            sandbox_counts = [
+                int(item.strip())
+                for item in raw_sandbox_counts.split(",")
                 if item.strip()
             ]
         except ValueError as exc:
+            raise RuntimeError("[run] sandbox_counts 必须是逗号分隔的正整数") from exc
+        if len(sandbox_counts) != len(rates):
             raise RuntimeError(
-                "[run] rate_durations 必须是逗号分隔的正数"
-            ) from exc
-        if len(rate_durations) != len(rates):
-            raise RuntimeError(
-                f"[run] rate_durations 的数量 ({len(rate_durations)}) "
+                f"[run] sandbox_counts 的数量 ({len(sandbox_counts)}) "
                 f"必须与 rates 的数量 ({len(rates)}) 相同"
             )
-        if any(d <= 0 for d in rate_durations):
-            raise RuntimeError("[run] rate_durations 中每个值必须大于 0")
-    else:
-        rate_durations = [duration_seconds] * len(rates)
+        if any(count <= 0 for count in sandbox_counts):
+            raise RuntimeError("[run] sandbox_counts 中每个值必须大于 0")
 
     # Parse optional uniform interval between rates (rate_interval_seconds = 30)
     rate_interval_seconds = run_section.getfloat("rate_interval_seconds", fallback=0.0)
@@ -353,8 +356,7 @@ def load_configured_run(path: Path) -> ConfiguredRun:
         provider=provider,
         product_name=product_name,
         rates=rates,
-        duration_seconds=duration_seconds,
-        rate_durations=rate_durations,
+        sandbox_counts=sandbox_counts,
         rate_interval_seconds=rate_interval_seconds,
         storages=storages,
         max_workers=max_workers,
@@ -458,7 +460,7 @@ def one_trial_volcengine_native(
     product_name: str,
     storage: str,
     rate: int,
-    duration_seconds: float,
+    sandbox_count: int,
     configured_max_workers: int,
     effective_max_workers: int,
     trial_index: int,
@@ -608,11 +610,7 @@ def one_trial_volcengine_native(
         driver=settings.driver,
         storage=storage,
         target_rate_per_s=rate,
-        duration_seconds=(
-            int(duration_seconds)
-            if float(duration_seconds).is_integer()
-            else duration_seconds
-        ),
+        sandbox_count=sandbox_count,
         configured_max_workers=configured_max_workers,
         effective_max_workers=effective_max_workers,
         trial_index=trial_index,
@@ -652,7 +650,7 @@ def one_trial(
     product_name: str,
     storage: str,
     rate: int,
-    duration_seconds: float,
+    sandbox_count: int,
     configured_max_workers: int,
     effective_max_workers: int,
     trial_index: int,
@@ -670,7 +668,7 @@ def one_trial(
             product_name=product_name,
             storage=storage,
             rate=rate,
-            duration_seconds=duration_seconds,
+            sandbox_count=sandbox_count,
             configured_max_workers=configured_max_workers,
             effective_max_workers=effective_max_workers,
             trial_index=trial_index,
@@ -848,11 +846,7 @@ def one_trial(
         driver=settings.driver,
         storage=storage,
         target_rate_per_s=rate,
-        duration_seconds=(
-            int(duration_seconds)
-            if float(duration_seconds).is_integer()
-            else duration_seconds
-        ),
+        sandbox_count=sandbox_count,
         configured_max_workers=configured_max_workers,
         effective_max_workers=effective_max_workers,
         trial_index=trial_index,
@@ -891,11 +885,11 @@ def run_rate(
     product_name: str,
     storage: str,
     rate: int,
-    duration_seconds: float,
+    sandbox_count: int,
     max_workers: int,
     native_runtime: VolcengineNativeRuntime | None = None,
 ) -> list[TrialResult]:
-    attempts = max(1, math.ceil(rate * duration_seconds))
+    attempts = sandbox_count
     effective_max_workers = min(max_workers, attempts)
     futures: list[Future[TrialResult]] = []
     run_start = time.perf_counter() + 0.25
@@ -921,7 +915,7 @@ def run_rate(
                     product_name=product_name,
                     storage=storage,
                     rate=rate,
-                    duration_seconds=duration_seconds,
+                    sandbox_count=sandbox_count,
                     configured_max_workers=max_workers,
                     effective_max_workers=effective_max_workers,
                     trial_index=index + 1,
@@ -958,7 +952,7 @@ def summarize(
     exclude_first_from_mean: bool = True,
 ) -> list[dict]:
     groups: dict[
-        tuple[str, str, str, str, int, float, int, int],
+        tuple[str, str, str, str, int, int, int, int],
         list[TrialResult],
     ] = {}
     for row in results:
@@ -969,7 +963,7 @@ def summarize(
                 row.driver,
                 row.storage,
                 row.target_rate_per_s,
-                row.duration_seconds,
+                row.sandbox_count,
                 row.configured_max_workers,
                 row.effective_max_workers,
             ),
@@ -983,7 +977,7 @@ def summarize(
         driver,
         storage,
         rate,
-        duration_seconds,
+        sandbox_count,
         configured_max_workers,
         effective_max_workers,
     ), rows in sorted(groups.items()):
@@ -1028,7 +1022,7 @@ def summarize(
                 "storage": storage,
                 "target_rate_per_s": rate,
                 "rate_label": f"{rate}tps",
-                "duration_seconds": duration_seconds,
+                "sandbox_count": sandbox_count,
                 "configured_max_workers": configured_max_workers,
                 "effective_max_workers": effective_max_workers,
                 "attempts": attempts,
@@ -1142,7 +1136,7 @@ GLOBAL_HISTORY_DIMENSIONS = {
     "storage",
     "target_rate_per_s",
     "rate_label",
-    "duration_seconds",
+    "sandbox_count",
 }
 
 
@@ -1204,14 +1198,14 @@ def refresh_global_matrix(history_path: Path, matrix_path: Path) -> None:
                 row.get("product_name", row.get("provider", "")),
                 row.get("driver", "").strip() or "e2b",
                 row.get("storage", ""),
-                row.get("duration_seconds", ""),
+                row.get("sandbox_count", ""),
                 metric,
             )
             matrix.setdefault(key, {})[rate_column] = value
 
     metric_order = {name: index for index, name in enumerate(metric_fields)}
 
-    def duration_sort_value(value: str) -> tuple[int, float | str]:
+    def sandbox_count_sort_value(value: str) -> tuple[int, float | str]:
         try:
             return (0, float(value))
         except ValueError:
@@ -1223,7 +1217,7 @@ def refresh_global_matrix(history_path: Path, matrix_path: Path) -> None:
         key=lambda key: (
             key[0],
             key[4],
-            duration_sort_value(key[5]),
+            sandbox_count_sort_value(key[5]),
             metric_order.get(key[6], len(metric_order)),
             key[1],
         ),
@@ -1234,7 +1228,7 @@ def refresh_global_matrix(history_path: Path, matrix_path: Path) -> None:
         product_name,
         driver,
         storage,
-        duration_seconds,
+        sandbox_count,
         metric,
     ) in sorted_keys:
         values = matrix[
@@ -1244,7 +1238,7 @@ def refresh_global_matrix(history_path: Path, matrix_path: Path) -> None:
                 product_name,
                 driver,
                 storage,
-                duration_seconds,
+                sandbox_count,
                 metric,
             )
         ]
@@ -1255,7 +1249,7 @@ def refresh_global_matrix(history_path: Path, matrix_path: Path) -> None:
                 "product_name": product_name,
                 "driver": driver,
                 "storage": storage,
-                "duration_seconds": duration_seconds,
+                "sandbox_count": sandbox_count,
                 "metric": metric,
                 "unit": metric_unit(metric),
                 **{column: values.get(column, "") for column in rate_columns},
@@ -1268,7 +1262,7 @@ def refresh_global_matrix(history_path: Path, matrix_path: Path) -> None:
         "product_name",
         "driver",
         "storage",
-        "duration_seconds",
+        "sandbox_count",
         "metric",
         "unit",
         *rate_columns,
@@ -1359,7 +1353,7 @@ def result_title(results: list[TrialResult], test_name: str) -> str:
     }
     storages = list(dict.fromkeys(row.storage for row in results))
     rates = sorted({row.target_rate_per_s for row in results})
-    durations = sorted({row.duration_seconds for row in results})
+    sandbox_counts = sorted({row.sandbox_count for row in results})
     product_names = {row.product_name for row in results}
     if len(product_names) != 1:
         raise RuntimeError("同一结果目录只能保存一个产品的测试结果")
@@ -1371,14 +1365,11 @@ def result_title(results: list[TrialResult], test_name: str) -> str:
         product_part = results[0].provider
     storage_part = "-".join(storage_names.get(item, item) for item in storages)
     rate_part = "-".join(str(rate) for rate in rates) + "tps"
-    duration_part = "-".join(
-        str(int(value)) if float(value).is_integer() else f"{value:g}"
-        for value in durations
-    )
+    sandbox_count_part = "-".join(str(value) for value in sandbox_counts)
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
     raw_title = (
         f"{stamp}_{product_part}_{test_name}_{storage_part}_"
-        f"{rate_part}_持续{duration_part}s"
+        f"{rate_part}_各{sandbox_count_part}个"
     )
     return re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", raw_title).strip(" .")
 
@@ -1457,10 +1448,6 @@ def parse_provider(value: str) -> str:
     return provider
 
 
-def attempts_for(rates: list[int], duration: float, storages: list[str]) -> int:
-    return sum(max(1, math.ceil(rate * duration)) for rate in rates) * len(storages)
-
-
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="多产品云沙箱并发启动速度测试"
@@ -1507,10 +1494,10 @@ def build_parser() -> argparse.ArgumentParser:
             help="每秒发起创建数，默认 1,10,50,100,200",
         )
         target.add_argument(
-            "--duration-seconds",
-            type=float,
-            default=1.0,
-            help="每个档位发压持续秒数，默认 1",
+            "--sandbox-counts",
+            type=parse_csv_ints,
+            default=[1, 10, 50, 100, 200],
+            help="各档位创建的沙箱数量，须与 --rates 数量一致，默认 1,10,50,100,200",
         )
         target.add_argument(
             "--storages",
@@ -1537,40 +1524,22 @@ def print_plan(
     provider: str,
     product_name: str,
     rates: list[int],
-    duration: float,
+    sandbox_counts: list[int],
     storages: list[str],
-    rate_durations: list[float] | None = None,
     rate_interval_seconds: float = 0.0,
 ) -> None:
-    """Print the test plan.
-
-    rate_durations: per-rate durations overriding the global duration.
-    rate_interval_seconds: uniform pause between rates.
-    """
+    """Print the count-based test plan."""
     print(f"产品: {product_name} ({provider})")
     print(f"存储场景: {', '.join(storages)}")
     print(f"并发档位: {', '.join(str(rate) + '/s' for rate in rates)}")
-    has_per_rate = rate_durations is not None and rate_durations != [duration] * len(rates)
-    if not has_per_rate:
-        print(f"每档持续: {duration:g} 秒")
     if rate_interval_seconds > 0:
         print(f"档位间隔: {rate_interval_seconds:g} 秒")
     total_attempts = 0
     for storage in storages:
         for i, rate in enumerate(rates):
-            dur = rate_durations[i] if rate_durations else duration
-            n = max(1, math.ceil(rate * dur))
+            n = sandbox_counts[i]
             total_attempts += n
-            if has_per_rate:
-                print(
-                    f"  {storage:>4} @ {rate:>3}/s: "
-                    f"{n} 次创建  持续 {dur:g}s"
-                )
-            else:
-                print(
-                    f"  {storage:>4} @ {rate:>3}/s: "
-                    f"{n} 次创建"
-                )
+            print(f"  {storage:>4} @ {rate:>3}/s: {n} 个沙箱")
     print(f"预计 Sandbox.create 总次数: {total_attempts}")
 
 
@@ -1580,29 +1549,23 @@ def execute_run(
     provider: str,
     product_name: str,
     rates: list[int],
-    duration_seconds: float,
+    sandbox_counts: list[int],
     storages: list[str],
     max_workers: int,
     output: Path,
     confirm: bool,
     exclude_first_from_mean: bool,
-    rate_durations: list[float] | None = None,
     rate_interval_seconds: float = 0.0,
 ) -> int:
     """Execute the benchmark run.
 
-    rate_durations: per-rate durations (same length as rates). Falls back to
-                    duration_seconds for each rate when not provided.
     rate_interval_seconds: seconds to sleep after each rate completes before
                     starting the next one. Applied uniformly across all rates.
     """
-    if duration_seconds <= 0:
-        raise RuntimeError("duration_seconds 必须大于 0")
+    if len(sandbox_counts) != len(rates) or any(count <= 0 for count in sandbox_counts):
+        raise RuntimeError("sandbox_counts 必须与 rates 数量一致，且每个值必须大于 0")
     if max_workers <= 0:
         raise RuntimeError("max_workers 必须大于 0")
-
-    # Build effective per-rate durations.
-    effective_durations = rate_durations if rate_durations else [duration_seconds] * len(rates)
 
     for storage in storages:
         metadata_for(storage, settings)
@@ -1610,9 +1573,8 @@ def execute_run(
         provider,
         product_name,
         rates,
-        duration_seconds,
+        sandbox_counts,
         storages,
-        rate_durations=rate_durations,
         rate_interval_seconds=rate_interval_seconds,
     )
     print(f"SDK 驱动: {settings.driver}")
@@ -1642,10 +1604,10 @@ def execute_run(
     try:
         for storage in storages:
             for i, rate in enumerate(rates):
-                rate_dur = effective_durations[i]
+                sandbox_count = sandbox_counts[i]
                 print(
                     f"\n开始: product={product_name}, storage={storage}, "
-                    f"rate={rate}/s, duration={rate_dur:g}s"
+                    f"rate={rate}/s, sandbox_count={sandbox_count}"
                 )
                 all_results.extend(
                     run_rate(
@@ -1654,7 +1616,7 @@ def execute_run(
                         product_name=product_name,
                         storage=storage,
                         rate=rate,
-                        duration_seconds=rate_dur,
+                        sandbox_count=sandbox_count,
                         max_workers=max_workers,
                         native_runtime=native_runtime,
                     )
@@ -1693,13 +1655,13 @@ def execute_run(
 def main() -> int:
     args = build_parser().parse_args()
     if args.command == "plan":
-        if args.duration_seconds <= 0:
-            raise RuntimeError("--duration-seconds 必须大于 0")
+        if len(args.sandbox_counts) != len(args.rates):
+            raise RuntimeError("--sandbox-counts 必须与 --rates 数量一致")
         print_plan(
             args.provider,
             DEFAULT_PRODUCT_NAMES.get(args.provider, args.provider),
             args.rates,
-            args.duration_seconds,
+            args.sandbox_counts,
             args.storages,
         )
         return 0
@@ -1711,13 +1673,12 @@ def main() -> int:
             provider=configured.provider,
             product_name=configured.product_name,
             rates=configured.rates,
-            duration_seconds=configured.duration_seconds,
+            sandbox_counts=configured.sandbox_counts,
             storages=configured.storages,
             max_workers=configured.max_workers,
             output=configured.output,
             confirm=args.confirm,
             exclude_first_from_mean=configured.exclude_first_from_mean,
-            rate_durations=configured.rate_durations,
             rate_interval_seconds=configured.rate_interval_seconds,
         )
 
@@ -1731,7 +1692,7 @@ def main() -> int:
             product_name=DEFAULT_PRODUCT_NAMES.get(args.provider, args.provider),
             storage=args.storage,
             rate=1,
-            duration_seconds=1.0,
+            sandbox_count=1,
             configured_max_workers=1,
             effective_max_workers=1,
             trial_index=1,
@@ -1748,7 +1709,7 @@ def main() -> int:
         provider=args.provider,
         product_name=DEFAULT_PRODUCT_NAMES.get(args.provider, args.provider),
         rates=args.rates,
-        duration_seconds=args.duration_seconds,
+        sandbox_counts=args.sandbox_counts,
         storages=args.storages,
         max_workers=args.max_workers,
         output=args.output,

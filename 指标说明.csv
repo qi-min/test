@@ -5,7 +5,7 @@ driver,SDK驱动,-,阿里云为e2b；字节原生为volcengine_native
 storage,存储场景,-,none表示无挂载；oss表示对象存储；file表示文件存储
 target_rate_per_s,目标启动速率,次/秒,客户端每秒计划发起的Sandbox.create次数
 rate_label,档位标签,-,用于跨厂商结果矩阵显示；例如1tps、10tps、50tps
-duration_seconds,持续发压时间,秒,客户端按照目标启动速率持续发起请求的时间
+sandbox_count,计划创建数量,个,客户端在当前目标启动速率下计划创建的沙箱数量
 configured_max_workers,配置线程上限,个,命令配置的工作线程上限；当前默认1000
 effective_max_workers,实际线程上限,个,配置线程上限和当前档位请求数中的较小值
 attempts,请求数量,次,当前档位实际安排的创建请求数量

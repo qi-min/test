@@ -42,7 +42,7 @@ P99：99%的有效样本不超过该延迟。
 
 exclude_first_from_mean=true时，每个TPS档位的第一个沙箱不参与mean，但仍参与
 min、max、P50、P90、P95、P99和成功率统计。所有延迟单位均为毫秒，结果不需要
-再除以attempts或duration_seconds。
+再除以attempts或sandbox_count。
 
 四、成功率
 
@@ -63,7 +63,7 @@ product_name：结果中显示的产品名称。
 driver：实际使用的SDK驱动。
 storage：none为无挂载，oss为对象存储，file为文件存储。
 target_rate_per_s：目标每秒启动次数。
-duration_seconds：持续发压秒数。
+sandbox_count：当前并发档位计划创建的沙箱数量。
 attempts：计划并实际提交到线程池的任务数量。
 configured_max_workers：配置的线程上限。
 effective_max_workers：当前档位实际使用的线程上限。
