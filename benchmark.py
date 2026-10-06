@@ -33,6 +33,9 @@ DEFAULT_PRODUCT_NAMES = {
     "ags": "AGS",
 }
 PRINT_LOCK = threading.Lock()
+REST_SESSION_LOCAL = threading.local()
+REST_SESSIONS_LOCK = threading.Lock()
+REST_SESSIONS: list[requests.Session] = []
 
 
 # Check type constants
@@ -40,6 +43,33 @@ CHECK_TYPE_COMMAND = "command"
 CHECK_TYPE_REST = "rest"
 REST_CHECK_TIMEOUT_S = 60.0       # 1 min overall timeout for REST check
 REST_CHECK_POLL_INTERVAL_S = 0.01  # 10ms poll interval
+
+
+def rest_session() -> requests.Session:
+    """Return the Session owned by the current benchmark worker thread."""
+    session = getattr(REST_SESSION_LOCAL, "session", None)
+    if session is None:
+        session = requests.Session()
+        adapter = requests.adapters.HTTPAdapter(
+            pool_connections=1,
+            pool_maxsize=1,
+            max_retries=0,
+        )
+        session.mount("https://", adapter)
+        session.mount("http://", adapter)
+        REST_SESSION_LOCAL.session = session
+        with REST_SESSIONS_LOCK:
+            REST_SESSIONS.append(session)
+    return session
+
+
+def close_rest_sessions() -> None:
+    """Close REST Sessions created for the completed rate run."""
+    with REST_SESSIONS_LOCK:
+        sessions = list(REST_SESSIONS)
+        REST_SESSIONS.clear()
+    for session in sessions:
+        session.close()
 
 
 @dataclass(frozen=True)
@@ -83,6 +113,7 @@ Settings = E2BSettings | VolcengineNativeSettings
 class TrialResult:
     provider: str
     product_name: str
+    target_template: str
     driver: str
     storage: str
     target_rate_per_s: int
@@ -108,6 +139,10 @@ class TrialResult:
     cleanup_error_traceback: str
     ready_poll_count: int
     last_observed_status: str
+
+
+def target_template_for(settings: Settings) -> str:
+    return settings.template if isinstance(settings, E2BSettings) else ""
 
 
 @dataclass(frozen=True)
@@ -607,6 +642,7 @@ def one_trial_volcengine_native(
     return TrialResult(
         provider=provider,
         product_name=product_name,
+        target_template=target_template_for(settings),
         driver=settings.driver,
         storage=storage,
         target_rate_per_s=rate,
@@ -734,7 +770,11 @@ def one_trial(
             last_status_code: int | None = None
             while True:
                 try:
-                    response = requests.get(url, headers=headers, timeout=10)
+                    response = rest_session().get(
+                        url,
+                        headers=headers,
+                        timeout=10,
+                    )
                     last_status_code = response.status_code
                     rest_poll_count += 1
                     if response.status_code == 200:
@@ -750,6 +790,14 @@ def one_trial(
 
             first_command_ready = time.perf_counter()
             first_command_latency_ms = (first_command_ready - create_start) * 1000
+            if rest_poll_count > 1:
+                print(
+                    "  REST first health check "
+                    f"trial={trial_index} retries={rest_poll_count - 1} "
+                    f"polls={rest_poll_count} "
+                    f"final_status={last_status_code or '(无响应)'}",
+                    flush=True,
+                )
 
             if not first_rest_ok:
                 failure_phase = "first_command"
@@ -764,16 +812,22 @@ def one_trial(
                 current_phase = "second_command"
                 second_rest_ok = False
                 last_status_code2: int | None = None
+                second_rest_poll_count = 0
                 rest_deadline2 = time.perf_counter() + REST_CHECK_TIMEOUT_S
                 while True:
                     try:
-                        response2 = requests.get(url, headers=headers, timeout=10)
+                        response2 = rest_session().get(
+                            url,
+                            headers=headers,
+                            timeout=10,
+                        )
                         last_status_code2 = response2.status_code
+                        second_rest_poll_count += 1
                         if response2.status_code == 200:
                             second_rest_ok = True
                             break
                     except Exception:
-                        pass
+                        second_rest_poll_count += 1
 
                     remaining2 = rest_deadline2 - time.perf_counter()
                     if remaining2 <= 0:
@@ -782,6 +836,14 @@ def one_trial(
 
                 second_command_ready = time.perf_counter()
                 second_command_latency_ms = (second_command_ready - create_start) * 1000
+                if second_rest_poll_count > 1:
+                    print(
+                        "  REST second health check "
+                        f"trial={trial_index} retries={second_rest_poll_count - 1} "
+                        f"polls={second_rest_poll_count} "
+                        f"final_status={last_status_code2 or '(无响应)'}",
+                        flush=True,
+                    )
                 ready_success = second_rest_ok
                 if not ready_success:
                     failure_phase = "second_command"
@@ -843,6 +905,7 @@ def one_trial(
     return TrialResult(
         provider=provider,
         product_name=product_name,
+        target_template=target_template_for(settings),
         driver=settings.driver,
         storage=storage,
         target_rate_per_s=rate,
@@ -936,6 +999,7 @@ def run_rate(
                         f"  进度 {completed}/{attempts}",
                         flush=True,
                     )
+    close_rest_sessions()
     return sorted(results, key=lambda row: row.trial_index)
 
 
@@ -952,7 +1016,7 @@ def summarize(
     exclude_first_from_mean: bool = True,
 ) -> list[dict]:
     groups: dict[
-        tuple[str, str, str, str, int, int, int, int],
+        tuple[str, str, str, str, str, int, int, int, int],
         list[TrialResult],
     ] = {}
     for row in results:
@@ -960,6 +1024,7 @@ def summarize(
             (
                 row.provider,
                 row.product_name,
+                row.target_template,
                 row.driver,
                 row.storage,
                 row.target_rate_per_s,
@@ -974,6 +1039,7 @@ def summarize(
     for (
         provider,
         product_name,
+        target_template,
         driver,
         storage,
         rate,
@@ -1018,6 +1084,7 @@ def summarize(
             {
                 "provider": provider,
                 "product_name": product_name,
+                "target_template": target_template,
                 "driver": driver,
                 "storage": storage,
                 "target_rate_per_s": rate,
@@ -1132,6 +1199,7 @@ GLOBAL_HISTORY_DIMENSIONS = {
     "result_directory",
     "provider",
     "product_name",
+    "target_template",
     "driver",
     "storage",
     "target_rate_per_s",
@@ -1182,7 +1250,7 @@ def refresh_global_matrix(history_path: Path, matrix_path: Path) -> None:
     rate_columns = [f"{rate}tps" for rate in rates]
 
     # History is append-only, so later rows intentionally replace earlier cells.
-    matrix: dict[tuple[str, str, str, str, str, str, str], dict[str, str]] = {}
+    matrix: dict[tuple[str, str, str, str, str, str, str, str], dict[str, str]] = {}
     for row in history_rows:
         raw_rate = row.get("target_rate_per_s", "").strip()
         if not raw_rate:
@@ -1196,6 +1264,7 @@ def refresh_global_matrix(history_path: Path, matrix_path: Path) -> None:
                 row.get("test_name", ""),
                 row.get("provider", ""),
                 row.get("product_name", row.get("provider", "")),
+                row.get("target_template", ""),
                 row.get("driver", "").strip() or "e2b",
                 row.get("storage", ""),
                 row.get("sandbox_count", ""),
@@ -1216,9 +1285,9 @@ def refresh_global_matrix(history_path: Path, matrix_path: Path) -> None:
         matrix,
         key=lambda key: (
             key[0],
-            key[4],
-            sandbox_count_sort_value(key[5]),
-            metric_order.get(key[6], len(metric_order)),
+            key[5],
+            sandbox_count_sort_value(key[6]),
+            metric_order.get(key[7], len(metric_order)),
             key[1],
         ),
     )
@@ -1226,6 +1295,7 @@ def refresh_global_matrix(history_path: Path, matrix_path: Path) -> None:
         test_name,
         provider,
         product_name,
+        target_template,
         driver,
         storage,
         sandbox_count,
@@ -1236,6 +1306,7 @@ def refresh_global_matrix(history_path: Path, matrix_path: Path) -> None:
                 test_name,
                 provider,
                 product_name,
+                target_template,
                 driver,
                 storage,
                 sandbox_count,
@@ -1247,6 +1318,7 @@ def refresh_global_matrix(history_path: Path, matrix_path: Path) -> None:
                 "test_name": test_name,
                 "provider": provider,
                 "product_name": product_name,
+                "target_template": target_template,
                 "driver": driver,
                 "storage": storage,
                 "sandbox_count": sandbox_count,
@@ -1260,6 +1332,7 @@ def refresh_global_matrix(history_path: Path, matrix_path: Path) -> None:
         "test_name",
         "provider",
         "product_name",
+        "target_template",
         "driver",
         "storage",
         "sandbox_count",
@@ -1605,9 +1678,14 @@ def execute_run(
         for storage in storages:
             for i, rate in enumerate(rates):
                 sandbox_count = sandbox_counts[i]
+                e2b_target = (
+                    f", template={settings.template}, domain={settings.domain}"
+                    if isinstance(settings, E2BSettings)
+                    else ""
+                )
                 print(
                     f"\n开始: product={product_name}, storage={storage}, "
-                    f"rate={rate}/s, sandbox_count={sandbox_count}"
+                    f"rate={rate}/s, sandbox_count={sandbox_count}{e2b_target}"
                 )
                 all_results.extend(
                     run_rate(
