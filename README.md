@@ -126,6 +126,7 @@ Copy-Item benchmark.template.ini benchmark.ini
 
 ```ini
 [run]
+test_type = create
 product = aliyun
 rates = 1,10,50
 sandbox_counts = 10,100,500
@@ -134,6 +135,46 @@ max_workers = 1000
 output = results
 exclude_first_from_mean = true
 ```
+
+`test_type` 支持：
+
+- `create`：使用 `benchmark.py` 测试创建与就绪速度；
+- `connect`：使用 `connect_benchmark.py` 测试暂停和重新连接速度。
+
+### 0.1 E2B pause/connect 并发测试
+
+connect 测试仅支持 E2B SDK 驱动。配置中的 `template`、`api_key`、`domain`、
+`check_type`、`rest_port`、`rest_path` 和存储配置与启动测试完全复用。先将配置改为：
+
+```ini
+[run]
+test_type = connect
+product = aliyun
+rates = 1,10,50
+sandbox_counts = 10,100,500
+storages = none
+max_workers = 1000
+```
+
+预览计划：
+
+```powershell
+python connect_benchmark.py plan --config benchmark.ini
+```
+
+正式执行：
+
+```powershell
+python connect_benchmark.py run-config --config benchmark.ini --confirm
+```
+
+每个档位独立执行以下流程：创建指定数量的沙箱，每个沙箱先执行一次 command 或
+REST 访问确认可用，再按该档位 TPS 并发暂停，按同样 TPS 调用
+`Sandbox.connect`，执行两次 command 或 REST 访问，然后并发删除该档全部沙箱。
+暂停前访问不统计耗时；验证失败的沙箱不会进入暂停和 connect 阶段，但仍会统一
+清理。全部删除完成后才会进入下一档。报告包含 create、pause、connect、first
+access、second access 的 min、max、mean、P50、P90、P95、P99，以及各阶段成功率、
+调度延迟和失败日志。
 
 `sandbox_counts` 可选；填写时必须与 `rates` 的数量完全一致。若未填写，则每个
 档位均使用 `default_sandbox_count`，例如：
@@ -183,7 +224,7 @@ python benchmark.py run-config --config benchmark.ini --confirm
 字节使用火山原生 SDK 的 AK、SK、Region 和 veFaaS Function ID。真实凭证只能
 填写在本地 `benchmark.ini` 或对应环境变量中，不能提交到 GitHub。
 
-### 0.1 公平对比阿里云和字节
+### 0.2 公平对比阿里云和字节
 
 `[run]` 是两家产品共用的测试条件。切换厂商时只修改 `product`，下面这些字段
 必须保持完全相同：

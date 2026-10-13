@@ -147,6 +147,7 @@ def target_template_for(settings: Settings) -> str:
 
 @dataclass(frozen=True)
 class ConfiguredRun:
+    test_type: str
     provider: str
     product_name: str
     rates: list[int]
@@ -256,6 +257,9 @@ def load_configured_run(path: Path) -> ConfiguredRun:
     if "run" not in parser:
         raise RuntimeError("配置文件缺少 [run] 段")
     run_section = parser["run"]
+    test_type = run_section.get("test_type", "create").strip().lower() or "create"
+    if test_type not in {"create", "connect"}:
+        raise RuntimeError("[run] test_type 只支持 create 或 connect")
     try:
         provider = parse_provider(required_config_value(run_section, "product"))
         rates = parse_csv_ints(required_config_value(run_section, "rates"))
@@ -388,6 +392,7 @@ def load_configured_run(path: Path) -> ConfiguredRun:
             f"[{profile_name}] driver 只支持 e2b 或 volcengine_native"
         )
     return ConfiguredRun(
+        test_type=test_type,
         provider=provider,
         product_name=product_name,
         rates=rates,
@@ -1746,6 +1751,10 @@ def main() -> int:
 
     if args.command == "run-config":
         configured = load_configured_run(args.config)
+        if configured.test_type != "create":
+            raise RuntimeError(
+                "当前配置 test_type=connect；请使用 connect_benchmark.py run-config"
+            )
         return execute_run(
             settings=configured.settings,
             provider=configured.provider,
